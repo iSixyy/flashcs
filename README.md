@@ -28,6 +28,11 @@ How it works (details at the top of `FlashBangColorChanger.ahk`):
 4. Weak readings must repeat (`ConfirmChecks`), the result is smoothed over time, and the
    overlay fades out at the speed set by "Fading".
 5. Opacity = `Transparency` x curve(intensity). `Transparency` is now the **maximum**.
+6. The overlay has a 1-pixel hole at each sample point. On many systems `PixelGetColor`
+   also sees the overlay itself; without the holes the overlay darkened its own readings
+   and flickered on and off during a flash.
+7. On dark maps the brightness floor drops automatically (it follows the normal
+   brightness of the scene), so the grey haze at the end of a flash is still tracked.
 
 ### Settings (`settings.ini`)
 
@@ -41,11 +46,12 @@ only at full intensity). Missing keys get these defaults; invalid values are res
 | `ResponseCurve` | `1.5` | Shape of the response: >1 keeps partial flashes faint, 1 = linear. |
 | `SmoothingAlpha` | `0.7` | How fast the overlay rises (per 50 ms, 0.05-1). |
 | `WhiteTolerance` | `96` | Max difference between RGB channels still treated as white (0-255). |
-| `BrightnessFloor` | `0.45` | Luminance (0-1) under which a point does not count at all. |
+| `BrightnessFloor` | `0.45` | Luminance (0-1) under which a point does not count at all (maximum floor when `AdaptToScene=1`). |
 | `CoverageThreshold` | `70` | Percent of points that must be flashed (10-100). |
 | `SampleColumns`, `SampleRows` | `4`, `3` | Sample grid. Cost = columns x rows `PixelGetColor` calls per check (3x2 = old cost). |
 | `ConfirmChecks` | `2` | Consecutive checks needed before a weak/medium flash is shown. |
 | `TargetProcess` | `cs2.exe` | Only detect while this program is the active window. Empty = any window. |
+| `AdaptToScene` | `1` | Lower the brightness floor on dark maps (never above `BrightnessFloor`). `0` = fixed floor. |
 | `ShowDebug` | `0` | `1` shows the live values (intensity, opacity, sampling time) in a tooltip. |
 
 ### Limitations

@@ -15,6 +15,9 @@ Transparency := 200, CheckInterval := 50, FadingEvery := 10, BkColor := "0x00000
 SetFlashTuningDefaults()
 TargetProcess := "", ShowDebug := 0
 FlashInstantLevel := 0.8
+SampleX := [], SampleY := [], SampleGridW := 0, SampleGridH := 0, SampleGridCols := 0, SampleGridRows := 0
+SampleGridVersion := 0, OverlayHoleKey := "", OverlayHwnd := 0, OverlayColor := "", OverlayW := 0, OverlayH := 0
+SceneBaseline := 0.37, SceneLumMedian := 0.0, FlashFloor := 0.45, FlashSinceTick := 0, BaselineLastTick := 0
 ResetVars()
 
 Gui, g:-Caption +HwndGameHwnd
@@ -82,6 +85,8 @@ for _, r in rec {
         onsetT := r.t - whiteT
     if (r.t < 1000 && r.a > 0)
         earlyVisible := true
+    if (r.s = "white" && whiteT != "" && r.t - whiteT > 300)
+        whiteMin := (whiteMin = "") ? r.a : Min(whiteMin, r.a)
     if (lastA != "" && r.t > fadeStart) {
         maxDrop := Max(maxDrop, lastA - r.a)
         maxRiseInFade := Max(maxRiseInFade, r.a - lastA)
@@ -91,6 +96,7 @@ for _, r in rec {
 last := rec[rec.Length()]
 Check("A  no overlay before the flash", !earlyVisible, "")
 Check("C  full flash reaches >= 90% of max alpha within 250 ms", onsetT != "" && onsetT <= 250, onsetT " ms")
+Check("C  no flicker while the screen stays white (alpha >= 90% max all the time)", whiteMin != "" && whiteMin >= 0.9 * Transparency, whiteMin)
 Check("E  fade has no abrupt step (max drop per 50 ms <= 70)", maxDrop <= 70, maxDrop)
 Check("E  no flicker during fade (no rise > 5 while the flash fades)", maxRiseInFade <= 5, maxRiseInFade)
 Check("E  overlay hidden and animation timer stopped after the flash", !last.vis && !AnimTimerOn && last.a = 0, "vis=" last.vis " anim=" AnimTimerOn)
@@ -125,7 +131,7 @@ for _, r in rec
 Check("G  closing eyelids shows max opacity at once", a1 = Transparency, a1)
 Check("G  detection does not reopen eyelids (1 s, no flash)", EyelidsClosed = 1 && minA = Transparency, "closed=" EyelidsClosed " minAlpha=" minA)
 Hotkey_("ToggleOverlay")
-rec := RunTimeline([["normal", 700]])
+rec := RunTimeline([["normal", 2700]])
 Check("G  reopening fades out (alpha 0 < a < max after ~100 ms)", rec[2].a > 0 && rec[2].a < Transparency, rec[2].a)
 Check("G  reopening ends hidden with timers stopped", rec[rec.Length()].a = 0 && !OverlayVisible && !AnimTimerOn, St())
 ; eyelids closed during a flash, flash ends while closed
@@ -134,7 +140,7 @@ Hotkey_("ToggleOverlay")
 rec := RunTimeline([["normal", 800]])
 Check("G  eyelids keep priority after the flash ends", EyelidsClosed = 1 && rec[rec.Length()].a = Transparency, rec[rec.Length()].a)
 Hotkey_("ToggleOverlay")
-rec := RunTimeline([["normal", 700]])
+rec := RunTimeline([["normal", 2700]])
 Check("G  reopen after flash -> fades to hidden", rec[rec.Length()].a = 0 && !AnimTimerOn, St())
 
 ; ---------------- 5. enable / disable ----------------
@@ -178,7 +184,7 @@ while (A_TickCount - start < SoakSeconds * 1000) {
     Hotkey_("ToggleOverlay")
     cycles++
 }
-SetScene("normal"), Sleep(800)
+SetScene("normal"), Sleep(2800)
 WinGet, w1, List, % "ahk_pid " DllCall("GetCurrentProcessId")
 mem1 := PrivateBytes()
 Log(Format("  cycles {}  windows before {} after {}  working set {:.1f} MB -> {:.1f} MB  sampling avg {:.2f} ms max {:.2f} ms ({} px/check)"

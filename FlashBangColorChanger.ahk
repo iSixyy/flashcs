@@ -19,7 +19,10 @@ CoordMode, ToolTip, Screen
 ;   2. For every sample:
 ;        luminance L = (0.2126*R + 0.7152*G + 0.0722*B) / 255         (0..1)
 ;        spread    S = (max(R,G,B) - min(R,G,B)) / 255                (0 = neutral grey/white)
-;        bright    = clamp((L - BrightnessFloor) / (1 - BrightnessFloor))
+;        bright    = clamp((L - floor) / (1 - floor))
+;      floor = BrightnessFloor, or lower on dark maps when AdaptToScene=1: it follows the
+;      normal (unflashed) brightness of the scene + 0.08, never above BrightnessFloor.
+;      This keeps tracking the grey haze at the end of a flash on dark maps.
 ;        neutral   = clamp(1 - S / (WhiteTolerance / 255))
 ;        score     = bright * neutral                                 (0..1)
 ;      A bright yellow or a blue sky gets a low score because it is not neutral.
@@ -45,10 +48,10 @@ CoordMode, ToolTip, Screen
 ;   - Only the primary monitor is analysed and covered.
 ;   - The game must run in (borderless) windowed / fullscreen windowed mode; with
 ;     exclusive fullscreen PixelGetColor may read black and the overlay may not show.
-;   - The overlay is a layered (semi-transparent) window. As documented for
-;     PixelGetColor, such windows are normally not seen by it, so the overlay does not
-;     darken its own samples (the original script relied on this too). If on some
-;     system the overlay pulsed on and off by itself, that system is capturing it.
+;   - On many systems PixelGetColor also sees the overlay itself. The overlay window
+;     therefore has a 1-pixel hole at every sample point, so the samples always read
+;     the game and never the overlay (otherwise the overlay darkens its own readings
+;     and flickers). The holes are 12 single pixels with the default grid.
 ; =============================================================================
 
 ; Define path to settings file
@@ -83,7 +86,7 @@ global ShowStickyModKeyCount, Top_OffsetX, Top_OffsetY, Top_Screen, Top_Win, hGu
 global Transparency, CheckInterval, FadingEvery, BkColor
 global IntensitySensitivity, IntensityThreshold, ResponseCurve, SmoothingAlpha
 global WhiteTolerance, BrightnessFloor, CoverageThreshold, SampleColumns, SampleRows
-global ConfirmChecks, TargetProcess, ShowDebug
+global ConfirmChecks, TargetProcess, ShowDebug, AdaptToScene
 global FlashInstantLevel := 0.8     ; raw intensity that skips the ConfirmChecks wait
 
 ; --- Flash detection state ---
@@ -96,6 +99,9 @@ global OverlayHwnd := 0, OverlayVisible := false, OverlayAlpha := 0, OverlayColo
 global OverlayW := 0, OverlayH := 0
 global SampleX := [], SampleY := []
 global SampleGridW := 0, SampleGridH := 0, SampleGridCols := 0, SampleGridRows := 0
+global SampleGridVersion := 0, OverlayHoleKey := ""
+global SceneBaseline := 0.37, SceneLumMedian := 0.0, FlashFloor := 0.45
+global FlashSinceTick := 0, BaselineLastTick := 0
 
 ; Read saved settings or set defaults (missing keys keep the default value)
 SetFlashTuningDefaults()
@@ -111,6 +117,7 @@ IniRead, SampleRows, %IniFile%, Settings, SampleRows, %SampleRows%
 IniRead, ConfirmChecks, %IniFile%, Settings, ConfirmChecks, %ConfirmChecks%
 IniRead, TargetProcess, %IniFile%, Settings, TargetProcess, %TargetProcess%
 IniRead, ShowDebug, %IniFile%, Settings, ShowDebug, %ShowDebug%
+IniRead, AdaptToScene, %IniFile%, Settings, AdaptToScene, %AdaptToScene%
 SanitizeSettings()
 
 
@@ -591,6 +598,7 @@ SetFlashTuningDefaults() {
     ConfirmChecks := 2            ; consecutive checks needed for weak/medium flashes
     TargetProcess := "cs2.exe"    ; only detect while this exe is active ("" = any window)
     ShowDebug := 0                ; 1 = show live detection values in a tooltip
+    AdaptToScene := 1             ; 1 = lower the brightness floor on dark maps
 }
 
 ; Clamp a setting to a valid range; non-numeric values fall back to the default.
@@ -617,6 +625,7 @@ SanitizeSettings() {
     SampleRows := ClampSetting(SampleRows, 1, 12, 3, true)
     ConfirmChecks := ClampSetting(ConfirmChecks, 1, 10, 2, true)
     ShowDebug := ClampSetting(ShowDebug, 0, 1, 0, true)
+    AdaptToScene := ClampSetting(AdaptToScene, 0, 1, 1, true)
     TargetProcess := Trim(TargetProcess)
     if (TargetProcess = "ERROR")
         TargetProcess := ""
@@ -652,8 +661,10 @@ FlashDetectionTick() {
         ; CS2 is not the active window: skip sampling (saves CPU, no false positives)
         raw := 0.0
         FlashCoverage := 0.0, FlashMeanScore := 0.0, FlashValidSamples := 0, FlashSampleMs := 0.0
+        BaselineLastTick := 0
     } else {
         raw := EstimateFlashIntensity()
+        UpdateSceneBaseline(raw)
     }
     FlashRaw := raw
 
@@ -675,6 +686,33 @@ FlashDetectionTick() {
         ShowDebugInfo()
 }
 
+; Learn the normal brightness of the scene (median luminance of the samples) while no
+; flash is detected. It is frozen during a flash, for at most 5 s so a static bright
+; scene cannot keep it frozen forever. Time constant about 2 s.
+UpdateSceneBaseline(raw) {
+    now := A_TickCount
+    dt := BaselineLastTick ? now - BaselineLastTick : 0
+    BaselineLastTick := now
+    if (raw >= IntensityThreshold) {
+        if (!FlashSinceTick)
+            FlashSinceTick := now
+        if (now - FlashSinceTick < 5000)
+            return
+    } else {
+        FlashSinceTick := 0
+    }
+    if (FlashValidSamples = 0 || dt <= 0)
+        return
+    dt := dt > 500 ? 500 : dt
+    SceneBaseline += (SceneLumMedian - SceneBaseline) * (1.0 - Exp(-dt / 2000.0))
+}
+
+EnsureSampleGrid() {
+    if (A_ScreenWidth != SampleGridW || A_ScreenHeight != SampleGridH
+        || SampleColumns != SampleGridCols || SampleRows != SampleGridRows)
+        BuildSampleGrid()
+}
+
 ; Rebuild the sample grid (cell centres) for the current resolution and grid size.
 BuildSampleGrid() {
     SampleX := [], SampleY := []
@@ -687,6 +725,7 @@ BuildSampleGrid() {
     }
     SampleGridW := A_ScreenWidth, SampleGridH := A_ScreenHeight
     SampleGridCols := SampleColumns, SampleGridRows := SampleRows
+    SampleGridVersion++
 }
 
 ; Flash score of one RGB sample (0..1): bright AND neutral (close to white).
@@ -704,51 +743,67 @@ SpatialLevel(scores, coverage) {
     n := scores.Length()
     if (n = 0)
         return 0.0
-    ; insertion sort, ascending (n is small)
-    Loop, % n - 1 {
-        i := A_Index + 1
-        v := scores[i]
-        j := i - 1
-        while (j >= 1 && scores[j] > v) {
-            scores[j + 1] := scores[j]
-            j--
-        }
-        scores[j + 1] := v
-    }
+    SortAscending(scores)
     need := Ceil(coverage * n)
     need := need < 1 ? 1 : need
     return scores[n - need + 1]
 }
 
+; Insertion sort, ascending, in place (arrays here are small).
+SortAscending(arr) {
+    Loop, % arr.Length() - 1 {
+        i := A_Index + 1
+        v := arr[i]
+        j := i - 1
+        while (j >= 1 && arr[j] > v) {
+            arr[j + 1] := arr[j]
+            j--
+        }
+        arr[j + 1] := v
+    }
+}
+
 ; Estimated flash intensity (0..1) of the current screen. Not the real flash opacity.
 EstimateFlashIntensity() {
-    if (A_ScreenWidth != SampleGridW || A_ScreenHeight != SampleGridH
-        || SampleColumns != SampleGridCols || SampleRows != SampleGridRows)
-        BuildSampleGrid()
+    EnsureSampleGrid()
 
-    tol := WhiteTolerance / 255.0
-    scores := []
-    sum := 0.0, hits := 0
+    colors := [], lums := []
     DllCall("QueryPerformanceFrequency", "Int64*", qpf)
     DllCall("QueryPerformanceCounter", "Int64*", t0)
     Loop, % SampleX.Length() {
         PixelGetColor, c, % SampleX[A_Index], % SampleY[A_Index], RGB
         if ErrorLevel
             continue
-        score := SampleFlashScore(c, BrightnessFloor, tol)
-        scores.Push(score)
-        sum += score
-        if (score >= 0.5)
-            hits++
+        colors.Push(c)
+        lums.Push((0.2126 * ((c >> 16) & 0xFF) + 0.7152 * ((c >> 8) & 0xFF) + 0.0722 * (c & 0xFF)) / 255.0)
     }
     DllCall("QueryPerformanceCounter", "Int64*", t1)
     FlashSampleMs := qpf ? (t1 - t0) * 1000.0 / qpf : 0.0
 
-    n := scores.Length()
+    n := colors.Length()
     FlashValidSamples := n
     if (n = 0) {
         FlashCoverage := 0.0, FlashMeanScore := 0.0
         return 0.0
+    }
+    SortAscending(lums)
+    SceneLumMedian := lums[Ceil(n / 2)]
+
+    ; Brightness floor: the configured one, or lower on dark maps (never higher)
+    lumFloor := BrightnessFloor
+    if (AdaptToScene)
+        lumFloor := Max(0.2, Min(BrightnessFloor, SceneBaseline + 0.08))
+    FlashFloor := lumFloor
+
+    tol := WhiteTolerance / 255.0
+    scores := []
+    sum := 0.0, hits := 0
+    for _, c in colors {
+        score := SampleFlashScore(c, lumFloor, tol)
+        scores.Push(score)
+        sum += score
+        if (score >= 0.5)
+            hits++
     }
     FlashMeanScore := sum / n
     FlashCoverage := hits / n          ; share of clearly white samples (diagnostic)
@@ -780,6 +835,27 @@ EnsureOverlay(color) {
     }
 }
 
+; Cut a 1-pixel hole in the overlay at every sample point, so PixelGetColor reads the
+; game there even on systems where it would otherwise see the overlay itself.
+UpdateOverlayHoles() {
+    EnsureSampleGrid()
+    key := OverlayHwnd "|" SampleGridVersion "|" A_ScreenWidth "x" A_ScreenHeight
+    if (key = OverlayHoleKey)
+        return
+    rgn := DllCall("CreateRectRgn", "Int", 0, "Int", 0, "Int", A_ScreenWidth, "Int", A_ScreenHeight, "Ptr")
+    Loop, % SampleX.Length() {
+        hx := SampleX[A_Index] - 1      ; window coordinates: the overlay sits at x1
+        hy := SampleY[A_Index]
+        hole := DllCall("CreateRectRgn", "Int", hx, "Int", hy, "Int", hx + 1, "Int", hy + 1, "Ptr")
+        DllCall("CombineRgn", "Ptr", rgn, "Ptr", rgn, "Ptr", hole, "Int", 4)   ; RGN_DIFF
+        DllCall("DeleteObject", "Ptr", hole)
+    }
+    if DllCall("SetWindowRgn", "Ptr", OverlayHwnd, "Ptr", rgn, "Int", 1)
+        OverlayHoleKey := key           ; the system now owns rgn
+    else
+        DllCall("DeleteObject", "Ptr", rgn)
+}
+
 ApplyOverlayColor() {
     if (OverlayHwnd)
         EnsureOverlay(BkColor)
@@ -794,6 +870,7 @@ ShowOverlay(color := "Black", intensity := 1.0) {
         return 0
     }
     EnsureOverlay(color)
+    UpdateOverlayHoles()
     DetectHiddenWindows, On
     if (alpha != OverlayAlpha) {
         WinSet, Transparent, %alpha%, ahk_id %OverlayHwnd%
@@ -869,9 +946,9 @@ OverlayStep() {
 }
 
 ShowDebugInfo() {
-    ToolTip, % Format("raw {:.2f}  target {:.2f}  smooth {:.2f}  alpha {}  white {:.0f}%  mean {:.2f}  n {}  {:.1f} ms{}"
+    ToolTip, % Format("raw {:.2f}  target {:.2f}  smooth {:.2f}  alpha {}  white {:.0f}%  mean {:.2f}  floor {:.2f}  scene {:.2f}  n {}  {:.1f} ms{}"
         , FlashRaw, FlashTarget, FlashSmoothed, OverlayAlpha, FlashCoverage * 100, FlashMeanScore
-        , FlashValidSamples, FlashSampleMs, EyelidsClosed ? "  [eyelids]" : ""), 0, 0, 20
+        , FlashFloor, SceneBaseline, FlashValidSamples, FlashSampleMs, EyelidsClosed ? "  [eyelids]" : ""), 0, 0, 20
 }
 
 ResetFlashState() {
@@ -946,6 +1023,7 @@ SaveSettings() {
     IniWrite, %ConfirmChecks%, %IniFile%, Settings, ConfirmChecks
     IniWrite, %TargetProcess%, %IniFile%, Settings, TargetProcess
     IniWrite, %ShowDebug%, %IniFile%, Settings, ShowDebug
+    IniWrite, %AdaptToScene%, %IniFile%, Settings, AdaptToScene
 }
 
 OpenStartupFolder:

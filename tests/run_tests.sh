@@ -10,8 +10,13 @@ WINE="${WINE:-wine64}"
 python3 gen_scenes.py img
 export DISPLAY="${DISPLAY:-:99}"
 if ! xdpyinfo >/dev/null 2>&1; then Xvfb "$DISPLAY" -screen 0 1920x1080x24 & sleep 1; fi
-pgrep -x openbox >/dev/null || { openbox & sleep 1; }   # without a WM wine stalls ~2 s per window hide
-pgrep -x xcompmgr >/dev/null || { xcompmgr & sleep 1; } # real alpha blending of the overlay
+# Default: window manager + compositor (overlay alpha-blended, not seen by PixelGetColor).
+# CAPTURED=1: no WM/compositor, wine then lets PixelGetColor see the overlay, which
+# reproduces the flicker some Windows systems had before the sample holes.
+if [ "${CAPTURED:-0}" != 1 ]; then
+  pgrep -x openbox >/dev/null || { openbox & sleep 1; }
+  pgrep -x xcompmgr >/dev/null || { xcompmgr & sleep 1; }
+fi
 "$WINE" "$AHK" /ErrorStdOut /iLib NUL ../FlashBangColorChanger.ahk   # load-time syntax check
 rm -f results.txt
 "$WINE" "$AHK" /ErrorStdOut harness.ahk "$SOAK" native || true
