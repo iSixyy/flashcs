@@ -2,6 +2,54 @@
 #Persistent
 #SingleInstance Force
 SetBatchLines, -1
+; Sample absolute screen coordinates. The default CoordMode for Pixel is relative to the
+; active window, which moves the sample grid whenever another window has focus.
+CoordMode, Pixel, Screen
+CoordMode, ToolTip, Screen
+
+; =============================================================================
+; FLASH DETECTION - HOW IT WORKS AND ITS LIMITS (v2.53 dynamic overlay)
+; =============================================================================
+; PixelGetColor only returns the final RGB colour of a pixel. It does NOT expose the
+; alpha / opacity of CS2's flashbang effect, and nothing here reads game memory or
+; touches the game process. What this script computes is an ESTIMATE of how "flashed"
+; the image looks, built only from RGB samples:
+;
+;   1. A grid of SampleColumns x SampleRows points (cell centres) on the PRIMARY monitor.
+;   2. For every sample:
+;        luminance L = (0.2126*R + 0.7152*G + 0.0722*B) / 255         (0..1)
+;        spread    S = (max(R,G,B) - min(R,G,B)) / 255                (0 = neutral grey/white)
+;        bright    = clamp((L - BrightnessFloor) / (1 - BrightnessFloor))
+;        neutral   = clamp(1 - S / (WhiteTolerance / 255))
+;        score     = bright * neutral                                 (0..1)
+;      A bright yellow or a blue sky gets a low score because it is not neutral.
+;   3. Spatial coverage: the global level is the score that at least CoverageThreshold %
+;      of the valid samples reach (a percentile). A small white area (HUD, a lamp, a
+;      window in the map) cannot push the level up on its own.
+;   4. raw intensity = clamp(level * IntensitySensitivity)
+;   5. Persistence: a weak/medium raw value must repeat for ConfirmChecks consecutive
+;      checks before it is used; a very strong one (>= FlashInstantLevel) is used at once.
+;   6. Temporal smoothing: rises use an exponential filter (SmoothingAlpha per 50 ms),
+;      falls are rate limited by FadingEvery, so the overlay fades instead of vanishing.
+;   7. Overlay alpha (WinSet Transparent, 0 = invisible, 255 = opaque):
+;        alpha = Transparency * ((I - IntensityThreshold) / (1 - IntensityThreshold)) ^ ResponseCurve
+;      and 0 below IntensityThreshold. Transparency is the user's MAXIMUM, reached only
+;      at full estimated intensity. The overlay colour (BkColor) is never altered.
+;
+; Known limits:
+;   - This is not the physical opacity of the flash. A screen-filling white wall, a
+;     loading screen or any neutral bright image can look like a flash. Tune
+;     IntensitySensitivity / IntensityThreshold / BrightnessFloor / CoverageThreshold.
+;   - TargetProcess (default cs2.exe) limits detection to when CS2 is the active window,
+;     which removes false positives from other applications. Leave it empty to disable.
+;   - Only the primary monitor is analysed and covered.
+;   - The game must run in (borderless) windowed / fullscreen windowed mode; with
+;     exclusive fullscreen PixelGetColor may read black and the overlay may not show.
+;   - The overlay is a layered (semi-transparent) window. As documented for
+;     PixelGetColor, such windows are normally not seen by it, so the overlay does not
+;     darken its own samples (the original script relied on this too). If on some
+;     system the overlay pulsed on and off by itself, that system is capturing it.
+; =============================================================================
 
 ; Define path to settings file
 IniFile := A_ScriptDir . "\settings.ini"
@@ -14,23 +62,16 @@ if !FileExist(IniFile) {
     IniWrite, 0x000000, %IniFile%, Settings, BkColor
 }
 
-Winget, id, id, A
-WinSet, ExStyle, ^0x80,  ahk_id %id% ; 0x80 is WS_EX_TOOLWINDOW
-
 
 ; --- Default Settings ---
-TargetColor := 0xFFFFFF
-ColorTolerance := 10
-CoverageThreshold := 100
 IniRead, HotkeyToggle, %IniFile%, Settings, HotkeyToggle, }
 IniRead, HotkeyEyelids, %IniFile%, Settings, HotkeyEyelids, .
 IniRead, Transparency, %IniFile%, Settings, Transparency, 200
 IniRead, CheckInterval, %IniFile%, Settings, CheckInterval, 50
 IniRead, FadingEvery, %IniFile%, Settings, FadingEvery, 10
 IniRead, BkColor, %IniFile%, Settings, BkColor, 0x000000, 
-Enabled := true
-global EyelidsClosed = 0
-global valueFading := 200
+global Enabled := true
+global EyelidsClosed := 0
 
 global appVersion := "v2.53"
 global AutoGuiW, EyelidColor, Bottom_OffsetX, Bottom_OffsetY, Bottom_Screen, Bottom_Win, DisplaySec
@@ -38,13 +79,39 @@ global FixedX, FixedY, FontColor, FontName, FontSize, FontStyle, GuiHeight, GuiP
 global SettingsGuiIsOpen, ShowModifierKeyCount, ShowMouseButton, ShowSingleModifierKey
 global ShowStickyModKeyCount, Top_OffsetX, Top_OffsetY, Top_Screen, Top_Win, hGui_OSD, hGUI_s
 
+; --- Flash detection settings (stored in settings.ini, defaults in SetFlashTuningDefaults) ---
+global Transparency, CheckInterval, FadingEvery, BkColor
+global IntensitySensitivity, IntensityThreshold, ResponseCurve, SmoothingAlpha
+global WhiteTolerance, BrightnessFloor, CoverageThreshold, SampleColumns, SampleRows
+global ConfirmChecks, TargetProcess, ShowDebug
+global FlashInstantLevel := 0.8     ; raw intensity that skips the ConfirmChecks wait
 
+; --- Flash detection state ---
+; Only FlashDetectionTick writes FlashRaw/FlashTarget; only OverlayStep writes FlashSmoothed
+; (ToggleEyelids/ResetFlashState also reset it from hotkeys). Both run as Critical threads.
+global FlashRaw := 0.0, FlashTarget := 0.0, FlashSmoothed := 0.0, FlashConfirmCount := 0
+global FlashCoverage := 0.0, FlashMeanScore := 0.0, FlashValidSamples := 0, FlashSampleMs := 0.0
+global FlashLastStepTick := 0, AnimTimerOn := false
+global OverlayHwnd := 0, OverlayVisible := false, OverlayAlpha := 0, OverlayColor := ""
+global OverlayW := 0, OverlayH := 0
+global SampleX := [], SampleY := []
+global SampleGridW := 0, SampleGridH := 0, SampleGridCols := 0, SampleGridRows := 0
 
-; Read saved settings or set defaults
-
-
-
-
+; Read saved settings or set defaults (missing keys keep the default value)
+SetFlashTuningDefaults()
+IniRead, IntensitySensitivity, %IniFile%, Settings, IntensitySensitivity, %IntensitySensitivity%
+IniRead, IntensityThreshold, %IniFile%, Settings, IntensityThreshold, %IntensityThreshold%
+IniRead, ResponseCurve, %IniFile%, Settings, ResponseCurve, %ResponseCurve%
+IniRead, SmoothingAlpha, %IniFile%, Settings, SmoothingAlpha, %SmoothingAlpha%
+IniRead, WhiteTolerance, %IniFile%, Settings, WhiteTolerance, %WhiteTolerance%
+IniRead, BrightnessFloor, %IniFile%, Settings, BrightnessFloor, %BrightnessFloor%
+IniRead, CoverageThreshold, %IniFile%, Settings, CoverageThreshold, %CoverageThreshold%
+IniRead, SampleColumns, %IniFile%, Settings, SampleColumns, %SampleColumns%
+IniRead, SampleRows, %IniFile%, Settings, SampleRows, %SampleRows%
+IniRead, ConfirmChecks, %IniFile%, Settings, ConfirmChecks, %ConfirmChecks%
+IniRead, TargetProcess, %IniFile%, Settings, TargetProcess, %TargetProcess%
+IniRead, ShowDebug, %IniFile%, Settings, ShowDebug, %ShowDebug%
+SanitizeSettings()
 
 
 
@@ -84,6 +151,8 @@ ShowSettingsGUI() {
 		global CheckNVal
 		global NewEyelidToggle
 		global HotkeyEyelids
+		global SensN
+		global ThreshN
 		
 	SettingsGuiIsOpen := true
 
@@ -108,8 +177,18 @@ ShowSettingsGUI() {
 
 	Gui, s:Add, Text, xm yp+28, ____________________________________
 
-	Gui, s:Add, Text, xm y+1, Transparency:
+	Gui, s:Add, Text, xm y+1, Max opacity (reached at full flash):
 	Gui, s:Add, Slider, xm+10 w300 vTransN Range50-255 ToolTip gUpdateTransVal, %Transparency%
+
+	Gui, s:Add, Text, xm yp+25, ____________________________________
+
+	Gui, s:Add, Text, xm y+1, Flash sensitivity (100 = normal):
+	Gui, s:Add, Slider, xm+10 w300 vSensN Range25-400 ToolTip gUpdateSensitivity, % Round(IntensitySensitivity * 100)
+
+	Gui, s:Add, Text, xm yp+25, ____________________________________
+
+	Gui, s:Add, Text, xm y+1, Ignore flashes weaker than (percent):
+	Gui, s:Add, Slider, xm+10 w300 vThreshN Range0-95 ToolTip gUpdateThreshold, % Round(IntensityThreshold * 100)
 
 	Gui, s:Add, Text, xm yp+25, ____________________________________
 
@@ -192,14 +271,25 @@ ShowSettingsGUI() {
 		SaveSettings()
 	return
 
+	UpdateSensitivity:
+		GuiControlGet, SensN
+		IntensitySensitivity := SensN / 100.0
+		SaveSettings()
+	return
+
+	UpdateThreshold:
+		GuiControlGet, ThreshN
+		IntensityThreshold := ThreshN / 100.0
+		SaveSettings()
+	return
+
 	UpdateCheckInterval:
 		global CheckNVal
 		global CheckN
 		GuiControlGet, CheckN
 		GuiControl,, CheckNVal, % CheckN
 		CheckInterval = %CheckN%
-		SetTimer, CheckForColor, Off     ; Stop the existing timer
-		SetTimer, CheckForColor, %CheckInterval%
+		RestartDetectionTimer()
 		SaveSettings()
 	return
 	
@@ -214,8 +304,8 @@ ShowSettingsGUI() {
 		global BkColor
 		newColor := BkColor
 		if Select_Color(hGUI_s, newColor) {
-			Gui, 1:Color, %newColor%
 			BkColor := newColor
+			ApplyOverlayColor()
 			SaveSettings()
 		}
 	return
@@ -326,8 +416,8 @@ ShowSettingsGUI() {
 		global HotkeyToggle, HotkeyEyelids, Transparency, CheckInterval, FadingEvery, BkColor
 		
 		; Unbind hotkeys
-		Hotkey, %HotkeyToggle%, ToggleScript, Off
-		Hotkey, %HotkeyEyelids%, ToggleOverlay, Off
+		Try Hotkey, %HotkeyToggle%, ToggleScript, Off
+		Try Hotkey, %HotkeyEyelids%, ToggleOverlay, Off
 		
 		; Load them into your script variables again
 		HotkeyToggle := "}"  ; Set the default value for HotkeyToggle
@@ -336,6 +426,7 @@ ShowSettingsGUI() {
 		CheckInterval := 50  ; Set the default value for CheckInterval
 		FadingEvery := 10    ; Set the default value for FadingEvery
 		BkColor := 0x000000  ; Set the default value for BkColor
+		SetFlashTuningDefaults()  ; Flash detection settings
 		
 		; Update GUI controls with new values
 		GuiControl,, NewHotkey, %HotkeyToggle%
@@ -343,11 +434,17 @@ ShowSettingsGUI() {
 		GuiControl,, TransN, %Transparency%
 		GuiControl,, CheckN, %CheckInterval%
 		GuiControl,, FadingEveryN, %FadingEvery%
+		GuiControl,, SensN, % Round(IntensitySensitivity * 100)
+		GuiControl,, ThreshN, % Round(IntensityThreshold * 100)
 		GuiControl,, ColorInput, %BkColor%
 		
 		; Rebind hotkeys with default values
 		Hotkey, %HotkeyToggle%, ToggleScript, On
 		Hotkey, %HotkeyEyelids%, ToggleOverlay, On
+
+		; Apply the restored interval and colour to the running detection/overlay
+		RestartDetectionTimer()
+		ApplyOverlayColor()
 		
 		; Save the reset settings to the INI file
 		SaveSettings()
@@ -458,130 +555,353 @@ convert_Color(Color) { ; convert RGB <--> BGR
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 ; Set initial hotkey
 Hotkey, %HotkeyToggle%, ToggleScript, On
 Hotkey, %HotkeyEyelids%, ToggleOverlay, On
 
+; Save settings on any exit (this used to sit after the auto-execute "return" and never ran)
+OnExit("OnScriptExit")
+
 ; --- Set Timer ---
-SetTimer, CheckForColor, %CheckInterval%
+RestartDetectionTimer()
 
 return
 
 
 
 
+
+
+
+
+; --- SETTINGS HELPERS ---
+
+; Default values of the flash detection settings. Used at start-up (as IniRead defaults)
+; and by "Reset to Defaults".
+SetFlashTuningDefaults() {
+    IntensitySensitivity := 1.0   ; multiplier on the estimated intensity
+    IntensityThreshold := 0.25    ; below this estimated intensity the overlay stays hidden
+    ResponseCurve := 1.5          ; >1 keeps partial flashes faint, 1 = linear
+    SmoothingAlpha := 0.7         ; rise speed per 50 ms (0.05 slow .. 1 instant)
+    WhiteTolerance := 96          ; max channel spread (0-255) still counted as white
+    BrightnessFloor := 0.45       ; luminance (0-1) below which a sample scores 0
+    CoverageThreshold := 70       ; percent of samples that must reach the level
+    SampleColumns := 4            ; sample grid (cost = columns x rows PixelGetColor calls)
+    SampleRows := 3
+    ConfirmChecks := 2            ; consecutive checks needed for weak/medium flashes
+    TargetProcess := "cs2.exe"    ; only detect while this exe is active ("" = any window)
+    ShowDebug := 0                ; 1 = show live detection values in a tooltip
+}
+
+; Clamp a setting to a valid range; non-numeric values fall back to the default.
+ClampSetting(value, lo, hi, def, isInteger := false) {
+    value := Trim(value)
+    if value is not number
+        return def
+    value := value < lo ? lo : value > hi ? hi : value
+    return isInteger ? Round(value) : value + 0.0
+}
+
+SanitizeSettings() {
+    Transparency := ClampSetting(Transparency, 50, 255, 200, true)
+    CheckInterval := ClampSetting(CheckInterval, 1, 500, 50, true)
+    FadingEvery := ClampSetting(FadingEvery, 5, 200, 10, true)
+    IntensitySensitivity := ClampSetting(IntensitySensitivity, 0.25, 4.0, 1.0)
+    IntensityThreshold := ClampSetting(IntensityThreshold, 0.0, 0.95, 0.25)
+    ResponseCurve := ClampSetting(ResponseCurve, 0.3, 4.0, 1.5)
+    SmoothingAlpha := ClampSetting(SmoothingAlpha, 0.05, 1.0, 0.7)
+    WhiteTolerance := ClampSetting(WhiteTolerance, 8, 255, 96, true)
+    BrightnessFloor := ClampSetting(BrightnessFloor, 0.0, 0.9, 0.45)
+    CoverageThreshold := ClampSetting(CoverageThreshold, 10, 100, 70, true)
+    SampleColumns := ClampSetting(SampleColumns, 1, 16, 4, true)
+    SampleRows := ClampSetting(SampleRows, 1, 12, 3, true)
+    ConfirmChecks := ClampSetting(ConfirmChecks, 1, 10, 2, true)
+    ShowDebug := ClampSetting(ShowDebug, 0, 1, 0, true)
+    TargetProcess := Trim(TargetProcess)
+    if (TargetProcess = "ERROR")
+        TargetProcess := ""
+}
+
+RestartDetectionTimer() {
+    if (Enabled)
+        SetTimer, CheckForColor, %CheckInterval%
+    else
+        SetTimer, CheckForColor, Off
+}
+
+Clamp01(v) {
+    return v < 0 ? 0.0 : v > 1 ? 1.0 : v
+}
 
 
 
 
 ; --- FUNCTIONS ---
 
+; Detection timer (every CheckInterval ms): samples the screen and updates FlashTarget.
 CheckForColor:
-if (!Enabled)
-    return
-
-FoundPixels := 0
-TotalSamples := 0
-Step := 500
-
-Loop, % (A_ScreenWidth // Step) {
-    x := (A_Index - 1) * Step
-    Loop, % (A_ScreenHeight // Step) {
-        y := (A_Index - 1) * Step
-        PixelGetColor, pixelColor, %x%, %y%, RGB
-        if (Abs((pixelColor & 0xFF) - (TargetColor & 0xFF)) <= ColorTolerance
-         && Abs(((pixelColor >> 8) & 0xFF) - ((TargetColor >> 8) & 0xFF)) <= ColorTolerance
-         && Abs(((pixelColor >> 16) & 0xFF) - ((TargetColor >> 16) & 0xFF)) <= ColorTolerance)
-        {
-            FoundPixels++
-        }
-        TotalSamples++
-    }
-}
-
-Coverage := (FoundPixels / TotalSamples) * 100
-
-if (Coverage >= CoverageThreshold or EyelidsClosed = 1)
-    ShowOverlay(BkColor)
+    FlashDetectionTick()
 return
 
+FlashDetectionTick() {
+    Critical
+    if (!Enabled)
+        return
 
-ShowOverlay(color := "Black") {
-    global Transparency
-	if (EyelidsClosed = 0){
-		Gui, Destroy
-	}
-    WinGet, activeWindow, ID, A  ; Save currently active window
-	Gui, +AlwaysOnTop +ToolWindow -Caption +E0x80020 +LastFound -DPIScale
-    Gui, Color, %color%
-
-    Gui, Show, x1 y0 w%A_ScreenWidth% h%A_ScreenHeight% NoActivate, Overlay
-    WinSet, Transparent, %Transparency%, Overlay
-    WinActivate, ahk_id %activeWindow%
-    SetTimer, FadeOutOverlay, 1
-}
-
-
-
-FadeOutOverlay:
-	global FadingEvery
-    FoundPixel := 0
-
-            PixelGetColor, pixelColor, 1, 1, RGB
-            if (Abs((pixelColor & 0xFF) - (TargetColor & 0xFF)) <= ColorTolerance
-             && Abs(((pixelColor >> 8) & 0xFF) - ((TargetColor >> 8) & 0xFF)) <= ColorTolerance
-             && Abs(((pixelColor >> 16) & 0xFF) - ((TargetColor >> 16) & 0xFF)) <= ColorTolerance)
-            {
-                FoundPixels++
-            }
-
-    if (FoundPixels > 0)
-    {
-;		MsgBox, This is a message.
-        valueFading := 200
-    } else if (EyelidsClosed = 1){
-;		Sleep 1000
-        valueFading := 200
-		EyelidsClosed = 0
+    if (TargetProcess != "" && !WinActive("ahk_exe " . TargetProcess)) {
+        ; CS2 is not the active window: skip sampling (saves CPU, no false positives)
+        raw := 0.0
+        FlashCoverage := 0.0, FlashMeanScore := 0.0, FlashValidSamples := 0, FlashSampleMs := 0.0
     } else {
-			valueFading -= FadingEvery
-			if (valueFading <= 0)
-			{
-				SetTimer, FadeOutOverlay, Off
-				Gui, Destroy
-				return	
-			}
+        raw := EstimateFlashIntensity()
     }
+    FlashRaw := raw
+
+    ; Persistence: weak/medium readings must repeat before they count, a strong one counts
+    ; at once, and once the overlay is showing the target simply follows the measurement.
+    if (raw >= IntensityThreshold) {
+        if (FlashConfirmCount < 1000)
+            FlashConfirmCount++
+    } else {
+        FlashConfirmCount := 0
+    }
+    confirmed := (raw >= FlashInstantLevel) || (FlashConfirmCount >= ConfirmChecks) || (FlashSmoothed > IntensityThreshold)
+    FlashTarget := confirmed ? raw : 0.0
+
+    if (FlashTarget > 0 || FlashSmoothed > 0 || EyelidsClosed)
+        StartOverlayAnimation()
+
+    if (ShowDebug)
+        ShowDebugInfo()
+}
+
+; Rebuild the sample grid (cell centres) for the current resolution and grid size.
+BuildSampleGrid() {
+    SampleX := [], SampleY := []
+    Loop, %SampleRows% {
+        py := Round((A_Index - 0.5) * A_ScreenHeight / SampleRows)
+        Loop, %SampleColumns% {
+            SampleX.Push(Round((A_Index - 0.5) * A_ScreenWidth / SampleColumns))
+            SampleY.Push(py)
+        }
+    }
+    SampleGridW := A_ScreenWidth, SampleGridH := A_ScreenHeight
+    SampleGridCols := SampleColumns, SampleGridRows := SampleRows
+}
+
+; Flash score of one RGB sample (0..1): bright AND neutral (close to white).
+SampleFlashScore(c, lumFloor, tol) {
+    r := (c >> 16) & 0xFF, g := (c >> 8) & 0xFF, b := c & 0xFF
+    lum := (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0
+    spread := (Max(r, g, b) - Min(r, g, b)) / 255.0
+    bright := Clamp01((lum - lumFloor) / (1.0 - lumFloor))
+    neutral := Clamp01(1.0 - spread / tol)
+    return bright * neutral
+}
+
+; Highest score reached by at least `coverage` (0..1) of the samples (sorts `scores`).
+SpatialLevel(scores, coverage) {
+    n := scores.Length()
+    if (n = 0)
+        return 0.0
+    ; insertion sort, ascending (n is small)
+    Loop, % n - 1 {
+        i := A_Index + 1
+        v := scores[i]
+        j := i - 1
+        while (j >= 1 && scores[j] > v) {
+            scores[j + 1] := scores[j]
+            j--
+        }
+        scores[j + 1] := v
+    }
+    need := Ceil(coverage * n)
+    need := need < 1 ? 1 : need
+    return scores[n - need + 1]
+}
+
+; Estimated flash intensity (0..1) of the current screen. Not the real flash opacity.
+EstimateFlashIntensity() {
+    if (A_ScreenWidth != SampleGridW || A_ScreenHeight != SampleGridH
+        || SampleColumns != SampleGridCols || SampleRows != SampleGridRows)
+        BuildSampleGrid()
+
+    tol := WhiteTolerance / 255.0
+    scores := []
+    sum := 0.0, hits := 0
+    DllCall("QueryPerformanceFrequency", "Int64*", qpf)
+    DllCall("QueryPerformanceCounter", "Int64*", t0)
+    Loop, % SampleX.Length() {
+        PixelGetColor, c, % SampleX[A_Index], % SampleY[A_Index], RGB
+        if ErrorLevel
+            continue
+        score := SampleFlashScore(c, BrightnessFloor, tol)
+        scores.Push(score)
+        sum += score
+        if (score >= 0.5)
+            hits++
+    }
+    DllCall("QueryPerformanceCounter", "Int64*", t1)
+    FlashSampleMs := qpf ? (t1 - t0) * 1000.0 / qpf : 0.0
+
+    n := scores.Length()
+    FlashValidSamples := n
+    if (n = 0) {
+        FlashCoverage := 0.0, FlashMeanScore := 0.0
+        return 0.0
+    }
+    FlashMeanScore := sum / n
+    FlashCoverage := hits / n          ; share of clearly white samples (diagnostic)
+    return Clamp01(SpatialLevel(scores, CoverageThreshold / 100.0) * IntensitySensitivity)
+}
+
+; Map an intensity (0..1) to a window alpha (0 = invisible .. Transparency = user maximum).
+IntensityToAlpha(intensity) {
+    i := Clamp01(intensity)
+    if (i <= IntensityThreshold)
+        return 0
+    u := (i - IntensityThreshold) / (1.0 - IntensityThreshold)
+    return Round(Transparency * (u ** ResponseCurve))
+}
+
+; Create the overlay window once and reuse it (it is only hidden/shown afterwards).
+; Click-through (WS_EX_TRANSPARENT), never activated (WS_EX_NOACTIVATE), layered, topmost.
+EnsureOverlay(color) {
+    DetectHiddenWindows, On
+    if (!OverlayHwnd || !WinExist("ahk_id " . OverlayHwnd)) {
+        Gui, 1:New, +AlwaysOnTop +ToolWindow -Caption +E0x08080020 +LastFound -DPIScale +HwndOverlayHwnd, Overlay
+        Gui, 1:Color, %color%
+        OverlayColor := color
+        OverlayVisible := false
+        OverlayAlpha := 0
+    } else if (color != OverlayColor) {
+        Gui, 1:Color, %color%
+        OverlayColor := color
+    }
+}
+
+ApplyOverlayColor() {
+    if (OverlayHwnd)
+        EnsureOverlay(BkColor)
+}
+
+; Show or update the overlay for an estimated intensity (0..1). The colour is used as is;
+; only the real window transparency changes with the intensity.
+ShowOverlay(color := "Black", intensity := 1.0) {
+    alpha := IntensityToAlpha(intensity)
+    if (alpha < 2) {
+        HideOverlay()
+        return 0
+    }
+    EnsureOverlay(color)
+    DetectHiddenWindows, On
+    if (alpha != OverlayAlpha) {
+        WinSet, Transparent, %alpha%, ahk_id %OverlayHwnd%
+        OverlayAlpha := alpha
+    }
+    if (!OverlayVisible || OverlayW != A_ScreenWidth || OverlayH != A_ScreenHeight) {
+        OverlayW := A_ScreenWidth, OverlayH := A_ScreenHeight
+        ; NA = show without activating, so the game keeps focus (x1 kept from the original)
+        Gui, 1:Show, NA x1 y0 w%OverlayW% h%OverlayH%
+        OverlayVisible := true
+    }
+    return alpha
+}
+
+HideOverlay() {
+    if (OverlayVisible)
+        Gui, 1:Hide
+    OverlayVisible := false
+    OverlayAlpha := 0
+}
+
+StartOverlayAnimation() {
+    if (!AnimTimerOn) {
+        AnimTimerOn := true
+        SetTimer, FadeOutOverlay, 15
+        OverlayStep()      ; react now instead of waiting for the first timer tick
+    }
+}
+
+StopOverlayAnimation() {
+    SetTimer, FadeOutOverlay, Off
+    AnimTimerOn := false
+    FlashLastStepTick := 0
+}
+
+; Animation timer (~15 ms, only while the overlay is active). It never samples the screen:
+; it moves FlashSmoothed toward FlashTarget, applies the eyelids and draws the overlay.
+FadeOutOverlay:
+    OverlayStep()
 return
+
+OverlayStep() {
+    Critical
+    now := A_TickCount
+    dt := FlashLastStepTick ? now - FlashLastStepTick : 15
+    FlashLastStepTick := now
+    dt := dt < 1 ? 1 : dt > 250 ? 250 : dt
+
+    if (!Enabled) {
+        StopOverlayAnimation()
+        HideOverlay()
+        return
+    }
+
+    if (FlashTarget > FlashSmoothed) {
+        ; rise: exponential smoothing, time-normalised to 50 ms
+        k := 1.0 - (1.0 - SmoothingAlpha) ** (dt / 50.0)
+        FlashSmoothed += (FlashTarget - FlashSmoothed) * k
+    } else {
+        ; fall: linear fade, full -> 0 in 3120/FadingEvery ms (312 ms at the default 10),
+        ; never below what is still detected
+        fadeMs := 3120.0 / FadingEvery
+        FlashSmoothed := Max(FlashTarget, FlashSmoothed - dt / fadeMs)
+    }
+    if (FlashSmoothed < 0.002)
+        FlashSmoothed := 0.0
+
+    ; Manual eyelids have priority: full configured opacity while closed.
+    ShowOverlay(BkColor, EyelidsClosed ? 1.0 : FlashSmoothed)
+
+    if (!EyelidsClosed && FlashSmoothed = 0 && FlashTarget = 0)
+        StopOverlayAnimation()
+}
+
+ShowDebugInfo() {
+    ToolTip, % Format("raw {:.2f}  target {:.2f}  smooth {:.2f}  alpha {}  white {:.0f}%  mean {:.2f}  n {}  {:.1f} ms{}"
+        , FlashRaw, FlashTarget, FlashSmoothed, OverlayAlpha, FlashCoverage * 100, FlashMeanScore
+        , FlashValidSamples, FlashSampleMs, EyelidsClosed ? "  [eyelids]" : ""), 0, 0, 20
+}
+
+ResetFlashState() {
+    EyelidsClosed := 0
+    FlashRaw := 0.0, FlashTarget := 0.0, FlashSmoothed := 0.0, FlashConfirmCount := 0
+    StopOverlayAnimation()
+    HideOverlay()
+    ToolTip,,,, 20
+}
 
 
 
 
 ; --- Hotkey Close Eyelids ---
+; Manual toggle, independent of detection: closed stays closed until pressed again.
+; On reopening, the overlay fades out (or keeps following a flash that is still detected).
 
 ToggleOverlay:
-    if (EyelidsClosed = 0) {
-		EyelidsClosed = 1
-    } else {
-		EyelidsClosed = 0
-    }
+    ToggleEyelids()
 return
+
+ToggleEyelids() {
+    Critical
+    if (!Enabled)
+        return
+    EyelidsClosed := EyelidsClosed ? 0 : 1
+    if (!EyelidsClosed)
+        FlashSmoothed := 1.0
+    StartOverlayAnimation()
+}
 
 
 
@@ -595,12 +915,16 @@ Enabled := !Enabled
     } else {
 		DllCall("ShowCursor", "Int", true)
     }
-Gui, Destroy
+ResetFlashState()        ; hides the overlay and stops the animation timer
+RestartDetectionTimer()  ; detection timer only runs while enabled
 return
 
 
 
-OnExit("SaveSettings")
+OnScriptExit(ExitReason := "", ExitCode := 0) {
+    SaveSettings()
+    return 0
+}
 
 SaveSettings() {
     global IniFile, HotkeyToggle, HotkeyEyelids, Transparency, CheckInterval, FadingEvery, BkColor
@@ -610,6 +934,18 @@ SaveSettings() {
     IniWrite, %CheckInterval%, %IniFile%, Settings, CheckInterval
     IniWrite, %FadingEvery%, %IniFile%, Settings, FadingEvery
     IniWrite, %BkColor%, %IniFile%, Settings, BkColor
+    IniWrite, % Round(IntensitySensitivity, 2), %IniFile%, Settings, IntensitySensitivity
+    IniWrite, % Round(IntensityThreshold, 2), %IniFile%, Settings, IntensityThreshold
+    IniWrite, % Round(ResponseCurve, 2), %IniFile%, Settings, ResponseCurve
+    IniWrite, % Round(SmoothingAlpha, 2), %IniFile%, Settings, SmoothingAlpha
+    IniWrite, %WhiteTolerance%, %IniFile%, Settings, WhiteTolerance
+    IniWrite, % Round(BrightnessFloor, 2), %IniFile%, Settings, BrightnessFloor
+    IniWrite, %CoverageThreshold%, %IniFile%, Settings, CoverageThreshold
+    IniWrite, %SampleColumns%, %IniFile%, Settings, SampleColumns
+    IniWrite, %SampleRows%, %IniFile%, Settings, SampleRows
+    IniWrite, %ConfirmChecks%, %IniFile%, Settings, ConfirmChecks
+    IniWrite, %TargetProcess%, %IniFile%, Settings, TargetProcess
+    IniWrite, %ShowDebug%, %IniFile%, Settings, ShowDebug
 }
 
 OpenStartupFolder:
